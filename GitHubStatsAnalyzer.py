@@ -1,193 +1,202 @@
 import requests
 from datetime import datetime
-import pandas as pd
-from collections import defaultdict
 import matplotlib.pyplot as plt
-import seaborn as sns
-import base64
-from io import BytesIO
+import json
+import os
+from collections import defaultdict
+from pathlib import Path
 
-class GitHubStatsAnalyzer:
-    def __init__(self, owner, repo):
-        self.owner = owner
-        self.repo = repo
-        self.base_url = f"https://api.github.com/repos/{owner}/{repo}"
-        self.headers = {"Accept": "application/vnd.github.v3+json"}
+class GitHubAnalyzer:
+    def __init__(self, config_file):
+        self.config = self._load_config(config_file)
+        self.output_dir = Path(self.config.get('output_directory', 'reports'))
+        self.output_dir.mkdir(exist_ok=True)
 
-    def get_repository_info(self):
-        """Get basic repository information."""
-        response = requests.get(self.base_url, headers=self.headers)
-        if response.status_code == 200:
-            return response.json()
-        return None
-
-    def get_branch_stats(self):
-        """Get statistics about all branches."""
-        branches_url = f"{self.base_url}/branches"
-        response = requests.get(branches_url, headers=self.headers)
-        
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch branches: {response.status_code}")
+    def _load_config(self, config_file):
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
             
-        branches = response.json()
-        return {
-            "total_branches": len(branches),
-            "branch_names": [branch["name"] for branch in branches],
-            "protected_branches": sum(1 for branch in branches if branch.get("protected", False))
-        }
+            if 'repositories' not in config:
+                raise ValueError("Missing 'repositories' list in config")
+            return config
+        except Exception as e:
+            print(f"Error loading config: {str(e)}")
+            raise
 
-    def get_commit_stats(self, branch="main"):
-        """Get commit statistics for a specific branch."""
-        commits_url = f"{self.base_url}/commits"
-        params = {"sha": branch, "per_page": 100}
-        
-        all_commits = []
-        page = 1
-        
-        while True:
-            params["page"] = page
-            response = requests.get(commits_url, headers=self.headers, params=params)
-            
-            if response.status_code != 200:
-                break
-                
-            commits = response.json()
-            if not commits:
-                break
-                
-            all_commits.extend(commits)
-            page += 1
-            
-            if len(all_commits) >= 500:
-                break
+    def get_repo_data(self, owner, repo):
+        """Get all repository data in one function"""
+        try:
+            # Get basic repo info
+            repo_url = f"https://api.github.com/repos/{owner}/{repo}"
+            repo_response = requests.get(repo_url)
+            if repo_response.status_code != 200:
+                print(f"Failed to get repo info: {repo_response.status_code}")
+                return None
+            repo_info = repo_response.json()
 
-        return self._analyze_commits(all_commits)
+            # Get commits
+            commits = []
+            page = 1
+            while page <= 5:  # Limit to 5 pages
+                commits_url = f"https://api.github.com/repos/{owner}/{repo}/commits"
+                commits_response = requests.get(commits_url, params={'page': page, 'per_page': 100})
+                if commits_response.status_code != 200 or not commits_response.json():
+                    break
+                commits.extend(commits_response.json())
+                page += 1
 
-    def _analyze_commits(self, commits):
-        """Analyze commit data and generate statistics."""
+            # Get branches
+            branches_url = f"https://api.github.com/repos/{owner}/{repo}/branches"
+            branches_response = requests.get(branches_url)
+            branches = branches_response.json() if branches_response.status_code == 200 else []
+
+            return {
+                'repo_info': repo_info,
+                'commits': commits,
+                'branches': branches
+            }
+        except Exception as e:
+            print(f"Error getting data for {owner}/{repo}: {str(e)}")
+            return None
+
+    def analyze_commits(self, commits):
         stats = {
-            "total_commits": len(commits),
-            "authors": defaultdict(int),
-            "commits_by_month": defaultdict(int),
-            "commits_by_day": defaultdict(int),
-            "commits_by_weekday": defaultdict(int),
-            "avg_commits_per_day": 0
+            'total_commits': len(commits),
+            'authors': defaultdict(int),
+            'commits_by_date': defaultdict(int)
         }
 
-        dates = []
-        
         for commit in commits:
-            author = commit["commit"]["author"]["name"]
-            stats["authors"][author] += 1
-            
-            date = datetime.strptime(commit["commit"]["author"]["date"], "%Y-%m-%dT%H:%M:%SZ")
-            month_key = date.strftime("%Y-%m")
-            day_key = date.strftime("%Y-%m-%d")
-            weekday = date.strftime("%A")
-            
-            stats["commits_by_month"][month_key] += 1
-            stats["commits_by_day"][day_key] += 1
-            stats["commits_by_weekday"][weekday] += 1
-            dates.append(date)
+            if not commit.get('commit'):
+                continue
+                
+            author = commit['commit'].get('author', {})
+            if not author:
+                continue
 
-        if dates:
-            date_range = (max(dates) - min(dates)).days + 1
-            stats["avg_commits_per_day"] = len(commits) / date_range
-            stats["date_range"] = {"start": min(dates), "end": max(dates)}
+            name = author.get('name', 'Unknown')
+            date = author.get('date', '')[:10]
+            
+            stats['authors'][name] += 1
+            stats['commits_by_date'][date] += 1
+
+        stats['authors'] = dict(sorted(
+            stats['authors'].items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        ))
 
         return stats
 
-    def _create_contributors_chart(self, commit_stats):
-        """Create a bar chart for top contributors."""
-        plt.figure(figsize=(10, 6))
-        authors = dict(sorted(commit_stats["authors"].items(), key=lambda x: x[1], reverse=True)[:10])
-        plt.bar(authors.keys(), authors.values())
+    def create_commit_graph(self, stats, filepath):
+        plt.figure(figsize=(12, 6))
+        
+        authors = list(stats['authors'].keys())[:10]
+        commits = [stats['authors'][author] for author in authors]
+        
+        plt.bar(authors, commits)
         plt.xticks(rotation=45, ha='right')
-        plt.title('Top 10 Contributors')
+        plt.title('Top Contributors')
         plt.tight_layout()
         
-        img = BytesIO()
-        plt.savefig(img, format='png')
+        plt.savefig(filepath)
         plt.close()
-        return base64.b64encode(img.getvalue()).decode()
 
-    def _create_commits_by_weekday_chart(self, commit_stats):
-        """Create a bar chart for commits by weekday."""
-        plt.figure(figsize=(10, 6))
-        weekdays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        commits = [commit_stats["commits_by_weekday"].get(day, 0) for day in weekdays]
-        plt.bar(weekdays, commits)
-        plt.xticks(rotation=45, ha='right')
-        plt.title('Commits by Weekday')
-        plt.tight_layout()
+    def analyze_repository(self, repo_info):
+        """Analyze a single repository"""
+        owner = repo_info['owner']
+        repo_name = repo_info['name']
         
-        img = BytesIO()
-        plt.savefig(img, format='png')
-        plt.close()
-        return base64.b64encode(img.getvalue()).decode()
+        print(f"Analyzing repository: {owner}/{repo_name}")
+        
+        # Create repository directory
+        repo_dir = self.output_dir / f"{owner}_{repo_name}"
+        repo_dir.mkdir(exist_ok=True)
+        
+        # Get repository data
+        data = self.get_repo_data(owner, repo_name)
+        if not data:
+            print(f"Failed to get data for {owner}/{repo_name}")
+            return None
+        
+        # Analyze commits
+        commit_stats = self.analyze_commits(data['commits'])
+        
+        # Create and save graph
+        graph_path = repo_dir / 'contributors_graph.png'
+        self.create_commit_graph(commit_stats, graph_path)
+        
+        # Generate report
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        report_content = f"""# GitHub Repository Analysis: {owner}/{repo_name}
+Generated on: {timestamp}
 
-    def generate_markdown_report(self):
-        """Generate a comprehensive Markdown report."""
-        try:
-            repo_info = self.get_repository_info()
-            branch_stats = self.get_branch_stats()
-            commit_stats = self.get_commit_stats()
-            
-            # Generate charts
-            contributors_chart = self._create_contributors_chart(commit_stats)
-            weekday_chart = self._create_commits_by_weekday_chart(commit_stats)
-            
-            report = f"""# GitHub Repository Analysis Report
-## {self.owner}/{self.repo}
+## Repository Information
+- Stars: {data['repo_info'].get('stargazers_count', 0)}
+- Forks: {data['repo_info'].get('forks_count', 0)}
+- Open Issues: {data['repo_info'].get('open_issues_count', 0)}
+- Created: {data['repo_info'].get('created_at', 'N/A')}
+- Last Updated: {data['repo_info'].get('updated_at', 'N/A')}
 
-### Repository Overview
-- **Description**: {repo_info.get('description', 'No description available')}
-- **Stars**: {repo_info.get('stargazers_count', 0):,}
-- **Forks**: {repo_info.get('forks_count', 0):,}
-- **Open Issues**: {repo_info.get('open_issues_count', 0):,}
-- **Created**: {repo_info.get('created_at', 'N/A')}
-- **Last Updated**: {repo_info.get('updated_at', 'N/A')}
+## Branch Information
+- Total Branches: {len(data['branches'])}
+- Branch Names: {', '.join(b['name'] for b in data['branches'])}
 
-### Branch Statistics
-- **Total Branches**: {branch_stats['total_branches']}
-- **Protected Branches**: {branch_stats['protected_branches']}
-
-#### Branch List
-{chr(10).join(['- ' + branch for branch in branch_stats['branch_names']])}
-
-### Commit Statistics
-- **Total Commits Analyzed**: {commit_stats['total_commits']:,}
-- **Average Commits per Day**: {commit_stats['avg_commits_per_day']:.2f}
-- **Analysis Period**: {commit_stats['date_range']['start'].strftime('%Y-%m-%d')} to {commit_stats['date_range']['end'].strftime('%Y-%m-%d')}
+## Commit Analysis
+- Total Commits Analyzed: {commit_stats['total_commits']}
 
 ### Top Contributors
-![Top Contributors](data:image/png;base64,{contributors_chart})
-
-### Commits by Weekday
-![Commits by Weekday](data:image/png;base64,{weekday_chart})
-
-### Monthly Commit Activity
-| Month | Commits |
-|-------|---------|
-{chr(10).join([f"| {month} | {commits} |" for month, commits in sorted(commit_stats['commits_by_month'].items(), reverse=True)[:6]])}
-
-### Additional Information
-- Repository URL: https://github.com/{self.owner}/{self.repo}
-- Analysis Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
----
-*This report was generated automatically using GitHubStatsAnalyzer*
 """
-            return report
-            
-        except Exception as e:
-            return f"# Error Generating Report\nAn error occurred: {str(e)}"
+        
+        # Add top contributors
+        for author, count in list(commit_stats['authors'].items())[:10]:
+            report_content += f"- {author}: {count} commits\n"
+        
+        # Add graph reference
+        report_content += "\n## Contribution Graph\n"
+        report_content += "![Contributors Graph](contributors_graph.png)\n"
+        
+        # Save report
+        report_file = repo_dir / f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        report_file.write_text(report_content)
+        
+        print(f"Report generated for {owner}/{repo_name}: {report_file}")
+        return report_file
 
-# Example usage
+    def analyze_all_repositories(self):
+        """Analyze all repositories from config"""
+        print(f"Starting analysis of {len(self.config['repositories'])} repositories...")
+        
+        reports = []
+        for repo in self.config['repositories']:
+            try:
+                report_file = self.analyze_repository(repo)
+                if report_file:
+                    reports.append(report_file)
+            except Exception as e:
+                print(f"Error analyzing {repo.get('owner', '')}/{repo.get('name', '')}: {str(e)}")
+        
+        if reports:
+            # Create summary report
+            summary_file = self.output_dir / f"analysis_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+            summary_content = "# GitHub Repository Analysis Summary\n\n"
+            summary_content += f"Analysis completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            summary_content += "## Generated Reports\n\n"
+            
+            for report in reports:
+                repo_name = report.parent.name
+                summary_content += f"- [{repo_name}]({report.name})\n"
+            
+            summary_file.write_text(summary_content)
+            reports.append(summary_file)
+        
+        return reports
+
 if __name__ == "__main__":
-    analyzer = GitHubStatsAnalyzer("microsoft", "vscode")
-    markdown_report = analyzer.generate_markdown_report()
-    
-    # Save to file
-    with open('github_report.md', 'w') as f:
-        f.write(markdown_report)
+    try:
+        analyzer = GitHubAnalyzer('config.json')
+        reports = analyzer.analyze_all_repositories()
+        print(f"\nAnalysis completed. Generated {len(reports)} reports.")
+    except Exception as e:
+        print(f"Error: {str(e)}")

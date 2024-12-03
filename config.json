@@ -1,0 +1,13 @@
+{
+    "output_directory": "reports",
+    "repositories": [
+        {
+            "owner": "microsoft",
+            "name": "vscode"
+        },
+        {
+            "owner": "facebook",
+            "name": "react"
+        }
+    ]
+}
